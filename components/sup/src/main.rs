@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2017 Chef Software Inc. and/or applicable contributors
+// Copyright (c) 2016 Chef Software Inc. and/or applicable contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -577,7 +577,7 @@ fn sub_load(m: &ArgMatches) -> Result<()> {
                             match util::pkg::installed(composite_spec.package_ident()) {
                                 Some(package) => package,
                                 // TODO (CM): this should be a proper error
-                                None => unreachable!(), 
+                                None => unreachable!(),
                             };
 
                         update_composite_service_specs(
@@ -1218,7 +1218,7 @@ fn composite_binds_from_input(m: &ArgMatches) -> Result<HashMap<String, Vec<Serv
                 // It's a composite bind
                 let service_name = parts[0];
                 let bind = format!("{}:{}", parts[1], parts[2]);
-                let mut binds = map.entry(service_name.to_string()).or_insert(vec![]);
+                let binds = map.entry(service_name.to_string()).or_insert(vec![]);
                 binds.push(ServiceBind::from_str(&bind)?);
             } else {
                 // You supplied a 2-part (i.e., standalone service)

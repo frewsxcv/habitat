@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2017 Chef Software Inc. and/or applicable contributors
+// Copyright (c) 2016 Chef Software Inc. and/or applicable contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -104,6 +104,19 @@ pub struct Service {
 }
 
 impl Service {
+    /// Create a new service struct by loading a package install from disk.
+    pub fn load(
+        sys: Arc<Sys>,
+        spec: ServiceSpec,
+        manager_fs_cfg: Arc<manager::FsCfg>,
+        organization: Option<&str>,
+    ) -> Result<Service> {
+        // The package for a spec should already be installed.
+        let fs_root_path = Path::new(&*FS_ROOT_PATH);
+        let package = PackageInstall::load(&spec.ident, Some(fs_root_path))?;
+        Ok(Self::new(sys, package, spec, manager_fs_cfg, organization)?)
+    }
+
     fn new(
         sys: Arc<Sys>,
         package: PackageInstall,
@@ -172,18 +185,6 @@ impl Service {
             .join("hooks")
     }
 
-    pub fn load(
-        sys: Arc<Sys>,
-        spec: ServiceSpec,
-        manager_fs_cfg: Arc<manager::FsCfg>,
-        organization: Option<&str>,
-    ) -> Result<Service> {
-        // The package for a spec should already be installed.
-        let fs_root_path = Path::new(&*FS_ROOT_PATH);
-        let package = PackageInstall::load(&spec.ident, Some(fs_root_path))?;
-        Ok(Self::new(sys, package, spec, manager_fs_cfg, organization)?)
-    }
-
     /// Create the service path for this package.
     pub fn create_svc_path(&self) -> Result<()> {
         debug!("{}, Creating svc paths", self.service_group);
@@ -235,21 +236,8 @@ impl Service {
         Ok(())
     }
 
-    fn start(&mut self, launcher: &LauncherCli) {
-        if let Some(err) = self.supervisor
-            .start(
-                &self.pkg,
-                &self.service_group,
-                launcher,
-                self.svc_encrypted_password.as_ref(),
-            )
-            .err()
-        {
-            outputln!(preamble self.service_group, "Service start failed: {}", err);
-        } else {
-            self.needs_reload = false;
-            self.needs_reconfiguration = false;
-        }
+    pub fn last_state_change(&self) -> Timespec {
+        self.supervisor.state_entered
     }
 
     pub fn stop(&mut self, launcher: &LauncherCli) {
@@ -258,32 +246,17 @@ impl Service {
         }
     }
 
-    fn reload(&mut self, launcher: &LauncherCli) {
-        self.needs_reload = false;
-        if self.process_down() || self.hooks.reload.is_none() {
-            if let Some(err) = self.supervisor
-                .restart(
-                    &self.pkg,
-                    &self.service_group,
-                    launcher,
-                    self.svc_encrypted_password.as_ref(),
-                )
-                .err()
-            {
-                outputln!(preamble self.service_group, "Service restart failed: {}", err);
-            }
-        } else {
-            let hook = self.hooks.reload.as_ref().unwrap();
+    pub fn suitability(&self) -> Option<u64> {
+        if !self.initialized {
+            return None;
+        }
+        self.hooks.suitability.as_ref().and_then(|hook| {
             hook.run(
                 &self.service_group,
                 &self.pkg,
                 self.svc_encrypted_password.as_ref(),
-            );
-        }
-    }
-
-    pub fn last_state_change(&self) -> Timespec {
-        self.supervisor.state_entered
+            )
+        })
     }
 
     pub fn tick(&mut self, census_ring: &CensusRing, launcher: &LauncherCli) -> bool {
@@ -351,6 +324,27 @@ impl Service {
         svc_updated
     }
 
+    pub fn to_rumor(&self, incarnation: u64) -> ServiceRumor {
+        let exported = match self.cfg.to_exported(&self.pkg) {
+            Ok(exported) => Some(exported),
+            Err(err) => {
+                outputln!(preamble self.service_group,
+                          "Failed to generate exported cfg for service rumor: {}",
+                          Red.bold().paint(format!("{}", err)));
+                None
+            }
+        };
+        let mut rumor = ServiceRumor::new(
+            self.sys.member_id.as_str(),
+            &self.pkg.ident,
+            &self.service_group,
+            &self.sys.as_sys_info(),
+            exported.as_ref(),
+        );
+        rumor.set_incarnation(incarnation);
+        rumor
+    }
+
     pub fn to_spec(&self) -> ServiceSpec {
         let mut spec = ServiceSpec::default_for(self.spec_ident.clone());
         spec.group = self.service_group.group().to_string();
@@ -371,62 +365,6 @@ impl Service {
             spec.svc_encrypted_password = Some(password.clone())
         }
         spec
-    }
-
-    fn all_binds_satisfied(&self, census_ring: &CensusRing) -> bool {
-        let mut ret = true;
-        for ref bind in self.binds.iter() {
-            if let Some(group) = census_ring.census_group_for(&bind.service_group) {
-                if group.members().iter().all(|m| !m.alive()) {
-                    ret = false;
-                    outputln!(preamble self.service_group,
-                              "The specified service group '{}' for binding '{}' is present in the \
-                               census, but currently has no live members.",
-                              Green.bold().paint(format!("{}", bind.service_group)),
-                              Green.bold().paint(format!("{}", bind.name)));
-                }
-
-            } else {
-                ret = false;
-                outputln!(preamble self.service_group,
-                          "The specified service group '{}' for binding '{}' is not (yet?) present \
-                          in the census data.",
-                          Green.bold().paint(format!("{}", bind.service_group)),
-                          Green.bold().paint(format!("{}", bind.name)));
-            }
-        }
-        ret
-    }
-
-    /// Updates the process state of the service's supervisor
-    fn check_process(&mut self) -> bool {
-        self.supervisor.check_process()
-    }
-
-    fn process_down(&self) -> bool {
-        self.supervisor.state == ProcessState::Down
-    }
-
-    /// Compares the current state of the service to the current state of the census ring and
-    /// re-renders all templatable content to disk.
-    ///
-    /// Returns true if any modifications were made.
-    fn update_templates(&mut self, census_ring: &CensusRing) -> bool {
-        let census_group = census_ring.census_group_for(&self.service_group).expect(
-            "Service update failed; unable to find own service group",
-        );
-        let cfg_updated = self.cfg.update(census_group);
-        if cfg_updated || census_ring.changed() {
-            let (reload, reconfigure) = {
-                let ctx = self.render_context(census_ring);
-                let reload = self.compile_hooks(&ctx);
-                let reconfigure = self.compile_configuration(&ctx);
-                (reload, reconfigure)
-            };
-            self.needs_reload = reload;
-            self.needs_reconfiguration = reconfigure;
-        }
-        cfg_updated
     }
 
     /// Replace the package of the running service and restart it's system process.
@@ -463,90 +401,29 @@ impl Service {
         self.initialized = false;
     }
 
-    pub fn to_rumor(&self, incarnation: u64) -> ServiceRumor {
-        let exported = match self.cfg.to_exported(&self.pkg) {
-            Ok(exported) => Some(exported),
-            Err(err) => {
+    fn all_binds_satisfied(&self, census_ring: &CensusRing) -> bool {
+        let mut ret = true;
+        for ref bind in self.binds.iter() {
+            if let Some(group) = census_ring.census_group_for(&bind.service_group) {
+                if group.members().iter().all(|m| !m.alive()) {
+                    ret = false;
+                    outputln!(preamble self.service_group,
+                              "The specified service group '{}' for binding '{}' is present in the \
+                               census, but currently has no live members.",
+                              Green.bold().paint(format!("{}", bind.service_group)),
+                              Green.bold().paint(format!("{}", bind.name)));
+                }
+
+            } else {
+                ret = false;
                 outputln!(preamble self.service_group,
-                          "Failed to generate exported cfg for service rumor: {}",
-                          Red.bold().paint(format!("{}", err)));
-                None
+                          "The specified service group '{}' for binding '{}' is not (yet?) present \
+                          in the census data.",
+                          Green.bold().paint(format!("{}", bind.service_group)),
+                          Green.bold().paint(format!("{}", bind.name)));
             }
-        };
-        let mut rumor = ServiceRumor::new(
-            self.sys.member_id.as_str(),
-            &self.pkg.ident,
-            &self.service_group,
-            &self.sys.as_sys_info(),
-            exported.as_ref(),
-        );
-        rumor.set_incarnation(incarnation);
-        rumor
-    }
-
-    /// Run initialization hook if present
-    fn initialize(&mut self) {
-        if self.initialized {
-            return;
         }
-        outputln!(preamble self.service_group, "Initializing");
-        self.initialized = true;
-        if let Some(ref hook) = self.hooks.init {
-            self.initialized = hook.run(
-                &self.service_group,
-                &self.pkg,
-                self.svc_encrypted_password.as_ref(),
-            )
-        }
-    }
-
-    /// Run reconfigure hook if present. Return false if it is not present, to trigger default
-    /// restart behavior.
-    fn reconfigure(&mut self) {
-        self.needs_reconfiguration = false;
-        if let Some(ref hook) = self.hooks.reconfigure {
-            hook.run(
-                &self.service_group,
-                &self.pkg,
-                self.svc_encrypted_password.as_ref(),
-            );
-        }
-    }
-
-    fn post_run(&mut self) {
-        if let Some(ref hook) = self.hooks.post_run {
-            hook.run(
-                &self.service_group,
-                &self.pkg,
-                self.svc_encrypted_password.as_ref(),
-            );
-        }
-    }
-
-    pub fn suitability(&self) -> Option<u64> {
-        if !self.initialized {
-            return None;
-        }
-        self.hooks.suitability.as_ref().and_then(|hook| {
-            hook.run(
-                &self.service_group,
-                &self.pkg,
-                self.svc_encrypted_password.as_ref(),
-            )
-        })
-    }
-
-    /// this function wraps create_dir_all so we can give friendly error
-    /// messages to the user.
-    fn create_dir_all<P: AsRef<Path>>(path: P) -> Result<()> {
-        debug!("Creating dir with subdirs: {:?}", &path.as_ref());
-        if let Err(e) = std::fs::create_dir_all(&path) {
-            Err(sup_error!(Error::Permissions(
-                format!("Can't create {:?}, {}", &path.as_ref(), e),
-            )))
-        } else {
-            Ok(())
-        }
+        ret
     }
 
     fn cache_health_check(&self, check_result: HealthCheck) {
@@ -581,6 +458,16 @@ impl Service {
                 err
             );
         }
+    }
+
+    fn cache_service_file(&mut self, service_file: &ServiceFile) -> bool {
+        let file = self.pkg.svc_files_path.join(&service_file.filename);
+        self.write_cache_file(file, &service_file.body)
+    }
+
+    /// Updates the process state of the service's supervisor
+    fn check_process(&mut self) -> bool {
+        self.supervisor.check_process()
     }
 
     /// Helper for compiling configuration templates into configuration files.
@@ -638,6 +525,22 @@ impl Service {
         Ok(())
     }
 
+    /// this function wraps create_dir_all so we can give friendly error
+    /// messages to the user.
+    fn create_dir_all<P>(path: P) -> Result<()>
+    where
+        P: AsRef<Path>,
+    {
+        debug!("Creating dir with subdirs: {:?}", &path.as_ref());
+        if let Err(e) = std::fs::create_dir_all(&path) {
+            Err(sup_error!(Error::Permissions(
+                format!("Can't create {:?}, {}", &path.as_ref(), e),
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
     fn execute_hooks(&mut self, launcher: &LauncherCli) {
         if !self.initialized {
             if self.check_process() {
@@ -681,27 +584,79 @@ impl Service {
         false
     }
 
-    /// Write service files from gossip data to disk.
-    ///
-    /// Returns true if a file was changed, added, or removed, and false if there were no updates.
-    fn update_service_files(&mut self, census_ring: &CensusRing) -> bool {
-        let census_group = census_ring.census_group_for(&self.service_group).expect(
-            "Service update service files failed; unable to find own service group",
-        );
-        let mut updated = false;
-        for service_file in census_group.changed_service_files() {
-            if self.cache_service_file(&service_file) {
-                outputln!(preamble self.service_group, "Service file updated, {}",
-                    service_file.filename);
-                updated = true;
-            }
+    /// Run initialization hook if present
+    fn initialize(&mut self) {
+        if self.initialized {
+            return;
         }
-        updated
+        outputln!(preamble self.service_group, "Initializing");
+        self.initialized = true;
+        if let Some(ref hook) = self.hooks.init {
+            self.initialized = hook.run(
+                &self.service_group,
+                &self.pkg,
+                self.svc_encrypted_password.as_ref(),
+            )
+        }
+    }
+
+    fn post_run(&mut self) {
+        if let Some(ref hook) = self.hooks.post_run {
+            hook.run(
+                &self.service_group,
+                &self.pkg,
+                self.svc_encrypted_password.as_ref(),
+            );
+        }
+    }
+
+    fn process_down(&self) -> bool {
+        self.supervisor.state == ProcessState::Down
+    }
+
+    /// Run reconfigure hook if present. Return false if it is not present, to trigger default
+    /// restart behavior.
+    fn reconfigure(&mut self) {
+        self.needs_reconfiguration = false;
+        if let Some(ref hook) = self.hooks.reconfigure {
+            hook.run(
+                &self.service_group,
+                &self.pkg,
+                self.svc_encrypted_password.as_ref(),
+            );
+        }
+    }
+
+    fn reload(&mut self, launcher: &LauncherCli) {
+        self.needs_reload = false;
+        if self.process_down() || self.hooks.reload.is_none() {
+            if let Some(err) = self.supervisor
+                .restart(
+                    &self.pkg,
+                    &self.service_group,
+                    launcher,
+                    self.svc_encrypted_password.as_ref(),
+                )
+                .err()
+            {
+                outputln!(preamble self.service_group, "Service restart failed: {}", err);
+            }
+        } else {
+            let hook = self.hooks.reload.as_ref().unwrap();
+            hook.run(
+                &self.service_group,
+                &self.pkg,
+                self.svc_encrypted_password.as_ref(),
+            );
+        }
     }
 
     /// attempt to remove a symlink in the /svc/run/foo/ directory if
     /// the link exists.
-    fn remove_symlink<P: AsRef<Path>>(p: P) -> Result<()> {
+    fn remove_symlink<P>(p: P) -> Result<()>
+    where
+        P: AsRef<Path>,
+    {
         let p = p.as_ref();
         if !p.exists() {
             return Ok(());
@@ -744,9 +699,61 @@ impl Service {
         self.cache_health_check(check_result);
     }
 
-    fn cache_service_file(&mut self, service_file: &ServiceFile) -> bool {
-        let file = self.pkg.svc_files_path.join(&service_file.filename);
-        self.write_cache_file(file, &service_file.body)
+    fn start(&mut self, launcher: &LauncherCli) {
+        if let Some(err) = self.supervisor
+            .start(
+                &self.pkg,
+                &self.service_group,
+                launcher,
+                self.svc_encrypted_password.as_ref(),
+            )
+            .err()
+        {
+            outputln!(preamble self.service_group, "Service start failed: {}", err);
+        } else {
+            self.needs_reload = false;
+            self.needs_reconfiguration = false;
+        }
+    }
+
+    /// Compares the current state of the service to the current state of the census ring and
+    /// re-renders all templatable content to disk.
+    ///
+    /// Returns true if any modifications were made.
+    fn update_templates(&mut self, census_ring: &CensusRing) -> bool {
+        let census_group = census_ring.census_group_for(&self.service_group).expect(
+            "Service update failed; unable to find own service group",
+        );
+        let cfg_updated = self.cfg.update(census_group);
+        if cfg_updated || census_ring.changed() {
+            let (reload, reconfigure) = {
+                let ctx = self.render_context(census_ring);
+                let reload = self.compile_hooks(&ctx);
+                let reconfigure = self.compile_configuration(&ctx);
+                (reload, reconfigure)
+            };
+            self.needs_reload = reload;
+            self.needs_reconfiguration = reconfigure;
+        }
+        cfg_updated
+    }
+
+    /// Write service files from gossip data to disk.
+    ///
+    /// Returns true if a file was changed, added, or removed, and false if there were no updates.
+    fn update_service_files(&mut self, census_ring: &CensusRing) -> bool {
+        let census_group = census_ring.census_group_for(&self.service_group).expect(
+            "Service update service files failed; unable to find own service group",
+        );
+        let mut updated = false;
+        for service_file in census_group.changed_service_files() {
+            if self.cache_service_file(&service_file) {
+                outputln!(preamble self.service_group, "Service file updated, {}",
+                    service_file.filename);
+                updated = true;
+            }
+        }
+        updated
     }
 
     fn write_cache_file<T>(&self, file: T, contents: &[u8]) -> bool
