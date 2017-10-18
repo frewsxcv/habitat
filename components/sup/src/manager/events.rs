@@ -35,6 +35,7 @@ enum Command {
     TryConnect(Vec<EventSrvAddr>),
 }
 
+#[derive(Clone)]
 pub struct EventsCli {
     group: ServiceGroup,
     tx: Sender<Command>,

@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+extern crate ansi_term;
+extern crate clap;
+extern crate env_logger;
 extern crate habitat_common as common;
 #[macro_use]
 extern crate habitat_core as hcore;
@@ -19,11 +22,8 @@ extern crate habitat_launcher_client as launcher_client;
 #[macro_use]
 extern crate habitat_sup as sup;
 extern crate log;
-extern crate env_logger;
-extern crate ansi_term;
 extern crate libc;
 #[macro_use]
-extern crate clap;
 extern crate time;
 extern crate url;
 
@@ -51,7 +51,7 @@ use hcore::package::install::PackageInstall;
 use hcore::package::metadata::{BindMapping, PackageType};
 use hcore::service::{ApplicationEnvironment, ServiceGroup};
 use hcore::url::{bldr_url_from_env, default_bldr_url};
-use launcher_client::{LauncherCli, ERR_NO_RETRY_EXCODE, OK_NO_RETRY_EXCODE};
+use launcher_client::{LauncherMgr, ERR_NO_RETRY_EXCODE, OK_NO_RETRY_EXCODE};
 use url::Url;
 
 use sup::VERSION;
@@ -84,7 +84,7 @@ fn main() {
     }
 }
 
-fn boot() -> Option<LauncherCli> {
+fn boot() -> bool {
     env_logger::init().unwrap();
     enable_features_from_env();
     if !crypto::init() {
@@ -93,15 +93,15 @@ fn boot() -> Option<LauncherCli> {
     }
     match launcher_client::env_pipe() {
         Some(pipe) => {
-            match LauncherCli::connect(pipe) {
-                Ok(launcher) => Some(launcher),
+            match LauncherMgr::boot(pipe) {
+                Ok(()) => true,
                 Err(err) => {
                     println!("{}", err);
                     process::exit(1);
                 }
             }
         }
-        None => None,
+        None => false,
     }
 }
 
@@ -120,13 +120,17 @@ fn start() -> Result<()> {
         ("config", Some(m)) => sub_config(m),
         ("load", Some(m)) => sub_load(m),
         ("run", Some(m)) => {
-            let launcher = launcher.ok_or(sup_error!(Error::NoLauncher))?;
-            sub_run(m, launcher)
+            if !launcher {
+                return Err(sup_error!(Error::NoLauncher));
+            }
+            sub_run(m)
         }
         ("sh", Some(m)) => sub_sh(m),
         ("start", Some(m)) => {
-            let launcher = launcher.ok_or(sup_error!(Error::NoLauncher))?;
-            sub_start(m, launcher)
+            if !launcher {
+                return Err(sup_error!(Error::NoLauncher));
+            }
+            sub_start(m)
         }
         ("status", Some(m)) => sub_status(m),
         ("stop", Some(m)) => sub_stop(m),
@@ -713,9 +717,9 @@ fn sub_unload(m: &ArgMatches) -> Result<()> {
     Ok(())
 }
 
-fn sub_run(m: &ArgMatches, launcher: LauncherCli) -> Result<()> {
+fn sub_run(m: &ArgMatches) -> Result<()> {
     let cfg = mgrcfg_from_matches(m)?;
-    let mut manager = Manager::load(cfg, launcher)?;
+    let mut manager = Manager::load(cfg)?;
     manager.run()
 }
 
@@ -730,7 +734,7 @@ fn sub_sh(m: &ArgMatches) -> Result<()> {
     command::shell::sh()
 }
 
-fn sub_start(m: &ArgMatches, launcher: LauncherCli) -> Result<()> {
+fn sub_start(m: &ArgMatches) -> Result<()> {
     if m.is_present("VERBOSE") {
         hcore::output::set_verbose(true);
     }
@@ -820,7 +824,7 @@ fn sub_start(m: &ArgMatches, launcher: LauncherCli) -> Result<()> {
             process::exit(OK_NO_RETRY_EXCODE);
         }
     } else {
-        let mut manager = Manager::load(cfg, launcher)?;
+        let mut manager = Manager::load(cfg)?;
         manager.run()
     }
 }
@@ -851,6 +855,7 @@ fn sub_status(m: &ArgMatches) -> Result<()> {
                 }
             };
 
+            // JW TODO: Talk to the http-gateway for this information.
             for spec in specs {
                 let status = Manager::service_status(&cfg, &spec.ident)?;
                 outputln!("{}", status);

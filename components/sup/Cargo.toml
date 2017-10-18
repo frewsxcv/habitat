@@ -36,7 +36,6 @@ libc = "*"
 log = "*"
 notify = "*"
 persistent = "*"
-prometheus = "*"
 protobuf = "*"
 rand = "*"
 regex = "*"
@@ -49,6 +48,7 @@ tempdir = "*"
 time = "*"
 toml = { version = "*", default-features = false }
 url = "*"
+zmq = { git = "https://github.com/erickt/rust-zmq", branch = "release/v0.8" }
 
 [target.'cfg(windows)'.dependencies]
 ctrlc = "*"

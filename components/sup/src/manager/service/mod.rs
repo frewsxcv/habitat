@@ -17,18 +17,20 @@ mod composite_spec;
 mod config;
 mod health;
 mod package;
+mod updater;
 mod spec;
 mod supervisor;
 
 use std;
+use std::borrow::Borrow;
 use std::fmt;
 use std::fs::File;
-use std::io::BufWriter;
+use std::hash::{Hash, Hasher};
 use std::io::prelude::*;
 use std::path::{Path, PathBuf};
 use std::result;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use ansi_term::Colour::{Yellow, Red, Green};
@@ -42,17 +44,7 @@ use hcore::util::perm::{set_owner, set_permissions};
 use launcher_client::LauncherCli;
 use serde;
 use time::Timespec;
-
-use super::Sys;
-use self::config::CfgRenderer;
-use self::hooks::{HOOK_PERMISSIONS, Hook, HookTable};
-use self::supervisor::Supervisor;
-use error::{Error, Result, SupError};
-use fs;
-use manager;
-use census::{ServiceFile, CensusRing, ElectionStatus};
-use templating::RenderContext;
-use util;
+use zmq;
 
 pub use self::config::Cfg;
 pub use self::health::{HealthCheck, SmokeCheck};
@@ -60,6 +52,16 @@ pub use self::package::Pkg;
 pub use self::composite_spec::CompositeSpec;
 pub use self::spec::{DesiredState, ServiceBind, ServiceSpec, StartStyle};
 pub use self::supervisor::ProcessState;
+use super::Sys;
+use self::config::CfgRenderer;
+use self::hooks::{HOOK_PERMISSIONS, Hook, HookTable};
+use self::supervisor::Supervisor;
+use SOCKET_CONTEXT;
+use error::{Error, Result, SupError};
+use fs;
+use census::{ServiceFile, CensusRing, ElectionStatus};
+use templating::RenderContext;
+use util;
 
 static LOGKEY: &'static str = "SR";
 
@@ -69,12 +71,74 @@ lazy_static! {
     };
 }
 
+pub struct ServiceCli {
+    group: ServiceGroup,
+    socket: zmq::Socket,
+    spec: ServiceSpec,
+}
+
+impl ServiceCli {
+    fn new(spec: ServiceSpec, group: ServiceGroup) -> Result<Self> {
+        let socket = (**SOCKET_CONTEXT).socket(zmq::REP).unwrap();
+        socket.connect(group.as_ref()).unwrap();
+        Ok(ServiceCli {
+            group: group,
+            socket: socket,
+            spec: spec,
+        })
+    }
+
+    pub fn group(&self) -> &ServiceGroup {
+        &self.group
+    }
+
+    pub fn start_style(&self) -> StartStyle {
+        self.spec.start_style
+    }
+
+    pub fn stop(&self) -> Result<()> {
+        unimplemented!()
+    }
+
+    pub fn tick(&self) -> Result<()> {
+        unimplemented!()
+    }
+}
+
+impl Borrow<ServiceGroup> for ServiceCli {
+    fn borrow(&self) -> &ServiceGroup {
+        &self.group
+    }
+}
+
+impl Eq for ServiceCli {}
+
+impl fmt::Display for ServiceCli {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.group)
+    }
+}
+
+impl Hash for ServiceCli {
+    fn hash<H>(&self, state: &mut H)
+    where
+        H: Hasher,
+    {
+        self.group.hash(state);
+    }
+}
+
+impl PartialEq for ServiceCli {
+    fn eq(&self, other: &ServiceCli) -> bool {
+        self.group == other.group
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct Service {
     pub service_group: ServiceGroup,
     pub bldr_url: String,
     pub channel: String,
-    pub spec_file: PathBuf,
     pub spec_ident: PackageIdent,
     pub start_style: StartStyle,
     pub topology: Topology,
@@ -86,6 +150,8 @@ pub struct Service {
 
     #[serde(skip_serializing)]
     config_renderer: CfgRenderer,
+    #[serde(skip_serializing)]
+    census_ring: Arc<RwLock<CensusRing>>,
     health_check: HealthCheck,
     last_election_status: ElectionStatus,
     needs_reload: bool,
@@ -96,37 +162,62 @@ pub struct Service {
     config_from: Option<PathBuf>,
     #[serde(skip_serializing)]
     last_health_check: Instant,
-    manager_fs_cfg: Arc<manager::FsCfg>,
     #[serde(rename = "process")]
     supervisor: Supervisor,
     svc_encrypted_password: Option<String>,
     composite: Option<String>,
 }
 
+/// Walk each service and check if it has an updated package installed via the Update Strategy.
+/// This updates the Service to point to the new service struct, and then marks it for
+/// restarting.
+///
+/// The run loop's last updated census is a required parameter on this function to inform the
+/// main loop that we, ourselves, updated the service counter when we updated ourselves.
+// fn check_for_updated_package(&mut self) {
+//     if self.updater.check_for_updated_package(service) {
+//         self.gossip_latest_service_rumor(&service);
+//     }
+// }
+
+
+// ON START
+// if let Err(e) = service.create_svc_path() {
+//     outputln!(
+//         "Can't create directory {}: {}",
+//         service.pkg.svc_path.display(),
+//         e
+//     );
+//     outputln!(
+//         "If this service is running as non-root, you'll need to create \
+//                {} and give the current user write access to it",
+//         service.pkg.svc_path.display()
+//     );
+//     outputln!("{} failed to start", &spec.ident);
+//     return;
+// }
+//
+// self.gossip_latest_service_rumor(&service);
+// if service.topology == Topology::Leader {
+//     self.butterfly.start_election(
+//         service.service_group.clone(),
+//         0,
+//     );
+// }
+
 impl Service {
     /// Create a new service struct by loading a package install from disk.
     pub fn load(
         sys: Arc<Sys>,
+        census: Arc<RwLock<CensusRing>>,
         spec: ServiceSpec,
-        manager_fs_cfg: Arc<manager::FsCfg>,
         organization: Option<&str>,
-    ) -> Result<Service> {
+    ) -> Result<ServiceCli> {
         // The package for a spec should already be installed.
         let fs_root_path = Path::new(&*FS_ROOT_PATH);
         let package = PackageInstall::load(&spec.ident, Some(fs_root_path))?;
-        Ok(Self::new(sys, package, spec, manager_fs_cfg, organization)?)
-    }
-
-    fn new(
-        sys: Arc<Sys>,
-        package: PackageInstall,
-        spec: ServiceSpec,
-        manager_fs_cfg: Arc<manager::FsCfg>,
-        organization: Option<&str>,
-    ) -> Result<Service> {
         spec.validate(&package)?;
         let pkg = Pkg::from_install(package)?;
-        let spec_file = manager_fs_cfg.specs_path.join(spec.file_name());
         let service_group = ServiceGroup::new(
             spec.application_environment.as_ref(),
             &pkg.name,
@@ -135,8 +226,10 @@ impl Service {
         )?;
         let config_root = Self::config_root(&pkg, spec.config_from.as_ref());
         let hooks_root = Self::hooks_root(&pkg, spec.config_from.as_ref());
+        let launcher = LauncherCli::connect(&mut SOCKET_CONTEXT)?;
         Ok(Service {
             sys: sys,
+            census_ring: census,
             cfg: Cfg::new(&pkg, spec.config_from.as_ref())?,
             config_renderer: CfgRenderer::new(&config_root)?,
             bldr_url: spec.bldr_url,
@@ -151,14 +244,12 @@ impl Service {
             last_election_status: ElectionStatus::None,
             needs_reload: false,
             needs_reconfiguration: false,
-            manager_fs_cfg: manager_fs_cfg,
-            supervisor: Supervisor::new(&service_group),
+            supervisor: Supervisor::new(&service_group, launcher),
             pkg: pkg,
             service_group: service_group,
             smoke_check: SmokeCheck::default(),
             binds: spec.binds,
             spec_ident: spec.ident,
-            spec_file: spec_file,
             start_style: spec.start_style,
             topology: spec.topology,
             update_strategy: spec.update_strategy,
@@ -240,8 +331,8 @@ impl Service {
         self.supervisor.state_entered
     }
 
-    pub fn stop(&mut self, launcher: &LauncherCli) {
-        if let Err(err) = self.supervisor.stop(launcher) {
+    pub fn stop(&mut self) {
+        if let Err(err) = self.supervisor.stop() {
             outputln!(preamble self.service_group, "Service stop failed: {}", err);
         }
     }
@@ -259,65 +350,76 @@ impl Service {
         })
     }
 
-    pub fn tick(&mut self, census_ring: &CensusRing, launcher: &LauncherCli) -> bool {
+    pub fn tick(&mut self) -> bool {
+        // JW TODO: If we change, we need to send ourself to the eventsrv
+        // if let Some(member) = census_group.me() {
+        //     events.as_ref().map(
+        //         |events| events.send_service(member, service),
+        //     );
+        // }
         if !self.initialized {
-            if !self.all_binds_satisfied(census_ring) {
+            if !self.all_binds_satisfied() {
                 outputln!(preamble self.service_group, "Waiting for service binds...");
                 return false;
             }
         }
 
-        let svc_updated = self.update_templates(census_ring);
-        if self.update_service_files(census_ring) {
+        let svc_updated = self.update_templates();
+        if self.update_service_files() {
             self.file_updated();
         }
 
         match self.topology {
             Topology::Standalone => {
-                self.execute_hooks(launcher);
+                self.execute_hooks();
             }
             Topology::Leader => {
-                let census_group = census_ring.census_group_for(&self.service_group).expect(
-                    "Service Group's census entry missing from list!",
-                );
-                match census_group.election_status {
-                    ElectionStatus::None => {
-                        if self.last_election_status != census_group.election_status {
-                            outputln!(preamble self.service_group,
-                                      "Waiting to execute hooks; {}",
-                                      Yellow.bold().paint("election hasn't started"));
-                            self.last_election_status = census_group.election_status;
+                {
+                    let census_ring = self.census_ring.read().unwrap();
+                    let census_group = census_ring.census_group_for(&self.service_group).expect(
+                        "Service Group's census entry missing from list!",
+                    );
+                    match census_group.election_status {
+                        ElectionStatus::None => {
+                            if self.last_election_status != census_group.election_status {
+                                outputln!(preamble self.service_group,
+                                          "Waiting to execute hooks; {}",
+                                          Yellow.bold().paint("election hasn't started"));
+                                self.last_election_status = census_group.election_status;
+                            }
+                        }
+                        ElectionStatus::ElectionInProgress => {
+                            if self.last_election_status != census_group.election_status {
+                                outputln!(preamble self.service_group,
+                                          "Waiting to execute hooks; {}",
+                                          Yellow.bold().paint("election in progress."));
+                                self.last_election_status = census_group.election_status;
+                            }
+                        }
+                        ElectionStatus::ElectionNoQuorum => {
+                            if self.last_election_status != census_group.election_status {
+                                outputln!(preamble self.service_group,
+                                          "Waiting to execute hooks; {}, {}.",
+                                          Yellow.bold().paint("election in progress"),
+                                          Red.bold().paint("and we have no quorum"));
+                                self.last_election_status = census_group.election_status
+                            }
+                        }
+                        ElectionStatus::ElectionFinished => {
+                            let leader_id = census_group.leader_id.as_ref().expect(
+                                "No leader with finished election",
+                            );
+                            if self.last_election_status != census_group.election_status {
+                                outputln!(preamble self.service_group,
+                                          "Executing hooks; {} is the leader",
+                                          Green.bold().paint(leader_id.to_string()));
+                                self.last_election_status = census_group.election_status;
+                            }
                         }
                     }
-                    ElectionStatus::ElectionInProgress => {
-                        if self.last_election_status != census_group.election_status {
-                            outputln!(preamble self.service_group,
-                                      "Waiting to execute hooks; {}",
-                                      Yellow.bold().paint("election in progress."));
-                            self.last_election_status = census_group.election_status;
-                        }
-                    }
-                    ElectionStatus::ElectionNoQuorum => {
-                        if self.last_election_status != census_group.election_status {
-                            outputln!(preamble self.service_group,
-                                      "Waiting to execute hooks; {}, {}.",
-                                      Yellow.bold().paint("election in progress"),
-                                      Red.bold().paint("and we have no quorum"));
-                            self.last_election_status = census_group.election_status
-                        }
-                    }
-                    ElectionStatus::ElectionFinished => {
-                        let leader_id = census_group.leader_id.as_ref().expect(
-                            "No leader with finished election",
-                        );
-                        if self.last_election_status != census_group.election_status {
-                            outputln!(preamble self.service_group,
-                                      "Executing hooks; {} is the leader",
-                                      Green.bold().paint(leader_id.to_string()));
-                            self.last_election_status = census_group.election_status;
-                        }
-                        self.execute_hooks(launcher)
-                    }
+                }
+                if self.last_election_status == ElectionStatus::ElectionFinished {
+                    self.execute_hooks()
                 }
             }
         }
@@ -368,7 +470,7 @@ impl Service {
     }
 
     /// Replace the package of the running service and restart it's system process.
-    pub fn update_package(&mut self, package: PackageInstall, launcher: &LauncherCli) {
+    pub fn update_package(&mut self, package: PackageInstall) {
         match Pkg::from_install(package) {
             Ok(pkg) => {
                 outputln!(preamble self.service_group,
@@ -394,15 +496,16 @@ impl Service {
                 return;
             }
         }
-        if let Err(err) = self.supervisor.stop(launcher) {
+        if let Err(err) = self.supervisor.stop() {
             outputln!(preamble self.service_group,
                       "Error stopping process while updating package: {}", err);
         }
         self.initialized = false;
     }
 
-    fn all_binds_satisfied(&self, census_ring: &CensusRing) -> bool {
+    fn all_binds_satisfied(&self) -> bool {
         let mut ret = true;
+        let census_ring = self.census_ring.read().unwrap();
         for ref bind in self.binds.iter() {
             if let Some(group) = census_ring.census_group_for(&bind.service_group) {
                 if group.members().iter().all(|m| !m.alive()) {
@@ -413,7 +516,6 @@ impl Service {
                               Green.bold().paint(format!("{}", bind.service_group)),
                               Green.bold().paint(format!("{}", bind.name)));
                 }
-
             } else {
                 ret = false;
                 outputln!(preamble self.service_group,
@@ -427,40 +529,10 @@ impl Service {
     }
 
     fn cache_health_check(&self, check_result: HealthCheck) {
-        let state_file = self.manager_fs_cfg.health_check_cache(&self.service_group);
-        let tmp_file = state_file.with_extension("tmp");
-        let file = match File::create(&tmp_file) {
-            Ok(file) => file,
-            Err(err) => {
-                warn!(
-                    "Couldn't open temporary health check file, {}, {}",
-                    self.service_group,
-                    err
-                );
-                return;
-            }
-        };
-        let mut writer = BufWriter::new(file);
-        if let Some(err) = writer
-            .write_all((check_result as i8).to_string().as_bytes())
-            .err()
-        {
-            warn!(
-                "Couldn't write to temporary health check state file, {}, {}",
-                self.service_group,
-                err
-            );
-        }
-        if let Some(err) = std::fs::rename(&tmp_file, &state_file).err() {
-            warn!(
-                "Couldn't finalize health check state file, {}, {}",
-                self.service_group,
-                err
-            );
-        }
+        unimplemented!()
     }
 
-    fn cache_service_file(&mut self, service_file: &ServiceFile) -> bool {
+    fn cache_service_file(&self, service_file: &ServiceFile) -> bool {
         let file = self.pkg.svc_files_path.join(&service_file.filename);
         self.write_cache_file(file, &service_file.body)
     }
@@ -541,7 +613,7 @@ impl Service {
         }
     }
 
-    fn execute_hooks(&mut self, launcher: &LauncherCli) {
+    fn execute_hooks(&mut self) {
         if !self.initialized {
             if self.check_process() {
                 outputln!("Reattached to {}", self.service_group);
@@ -550,7 +622,7 @@ impl Service {
             }
             self.initialize();
             if self.initialized {
-                self.start(launcher);
+                self.start();
                 self.post_run();
             }
         } else {
@@ -562,7 +634,7 @@ impl Service {
             // NOTE: if you need reconfiguration and you DON'T have a
             // reload script, you're going to restart anyway.
             if self.needs_reload || self.process_down() || self.needs_reconfiguration {
-                self.reload(launcher);
+                self.reload();
                 if self.needs_reconfiguration {
                     self.reconfigure()
                 }
@@ -627,14 +699,13 @@ impl Service {
         }
     }
 
-    fn reload(&mut self, launcher: &LauncherCli) {
+    fn reload(&mut self) {
         self.needs_reload = false;
         if self.process_down() || self.hooks.reload.is_none() {
             if let Some(err) = self.supervisor
                 .restart(
                     &self.pkg,
                     &self.service_group,
-                    launcher,
                     self.svc_encrypted_password.as_ref(),
                 )
                 .err()
@@ -699,12 +770,11 @@ impl Service {
         self.cache_health_check(check_result);
     }
 
-    fn start(&mut self, launcher: &LauncherCli) {
+    fn start(&mut self) {
         if let Some(err) = self.supervisor
             .start(
                 &self.pkg,
                 &self.service_group,
-                launcher,
                 self.svc_encrypted_password.as_ref(),
             )
             .err()
@@ -720,14 +790,15 @@ impl Service {
     /// re-renders all templatable content to disk.
     ///
     /// Returns true if any modifications were made.
-    fn update_templates(&mut self, census_ring: &CensusRing) -> bool {
+    fn update_templates(&mut self) -> bool {
+        let census_ring = self.census_ring.read().unwrap();
         let census_group = census_ring.census_group_for(&self.service_group).expect(
             "Service update failed; unable to find own service group",
         );
         let cfg_updated = self.cfg.update(census_group);
         if cfg_updated || census_ring.changed() {
             let (reload, reconfigure) = {
-                let ctx = self.render_context(census_ring);
+                let ctx = self.render_context(&census_ring);
                 let reload = self.compile_hooks(&ctx);
                 let reconfigure = self.compile_configuration(&ctx);
                 (reload, reconfigure)
@@ -741,7 +812,8 @@ impl Service {
     /// Write service files from gossip data to disk.
     ///
     /// Returns true if a file was changed, added, or removed, and false if there were no updates.
-    fn update_service_files(&mut self, census_ring: &CensusRing) -> bool {
+    fn update_service_files(&mut self) -> bool {
+        let census_ring = self.census_ring.read().unwrap();
         let census_group = census_ring.census_group_for(&self.service_group).expect(
             "Service update service files failed; unable to find own service group",
         );

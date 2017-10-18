@@ -16,15 +16,17 @@ extern crate habitat_core as core;
 extern crate habitat_launcher_protocol as protocol;
 extern crate ipc_channel;
 extern crate protobuf;
+extern crate zmq;
 
 pub mod error;
 mod client;
+mod manager;
 
 pub use protocol::{LAUNCHER_LOCK_CLEAN_ENV, LAUNCHER_PID_ENV, ERR_NO_RETRY_EXCODE,
                    OK_NO_RETRY_EXCODE};
-
 pub use client::LauncherCli;
 pub use error::Error;
+pub use manager::LauncherMgr;
 
 pub fn env_pipe() -> Option<String> {
     core::env::var(protocol::LAUNCHER_PIPE_ENV).ok()

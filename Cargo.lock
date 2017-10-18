@@ -775,6 +775,7 @@ dependencies = [
  "libc 0.2.22 (registry+https://github.com/rust-lang/crates.io-index)",
  "protobuf 1.2.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde 1.0.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "zmq 0.8.2 (git+https://github.com/erickt/rust-zmq?branch=release/v0.8)",
 ]
 
 [[package]]
@@ -1292,7 +1293,6 @@ dependencies = [
  "log 0.3.7 (registry+https://github.com/rust-lang/crates.io-index)",
  "notify 4.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "persistent 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "prometheus 0.2.8 (registry+https://github.com/rust-lang/crates.io-index)",
  "protobuf 1.2.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "rand 0.3.15 (registry+https://github.com/rust-lang/crates.io-index)",
  "regex 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -1306,6 +1306,7 @@ dependencies = [
  "toml 0.4.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "url 1.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "winapi 0.2.8 (registry+https://github.com/rust-lang/crates.io-index)",
+ "zmq 0.8.2 (git+https://github.com/erickt/rust-zmq?branch=release/v0.8)",
 ]
 
 [[package]]
@@ -2030,25 +2031,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "prometheus"
-version = "0.2.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-dependencies = [
- "cfg-if 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "fnv 1.0.5 (registry+https://github.com/rust-lang/crates.io-index)",
- "lazy_static 0.2.8 (registry+https://github.com/rust-lang/crates.io-index)",
- "protobuf 1.2.2 (registry+https://github.com/rust-lang/crates.io-index)",
- "quick-error 0.2.2 (registry+https://github.com/rust-lang/crates.io-index)",
-]
-
-[[package]]
 name = "protobuf"
 version = "1.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-
-[[package]]
-name = "quick-error"
-version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
@@ -2948,9 +2932,7 @@ dependencies = [
 "checksum postgres 0.14.0 (registry+https://github.com/rust-lang/crates.io-index)" = "aadd34ecc7aa81eae593f8299bb57e066277cda3d63713b2352245060713466d"
 "checksum postgres-protocol 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)" = "a8210267a051af88e19a35defb2a26ecd2f84a4f3cba66c28a849a8caa4471be"
 "checksum postgres-shared 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)" = "857ef343933a7d81e365a334f505a07db16ab7be64d9d7cd82c78d2f486777e4"
-"checksum prometheus 0.2.8 (registry+https://github.com/rust-lang/crates.io-index)" = "e1a4c5d63fb87824169dee5286dbb880d4b0a3ce0aad74dca1ac4afdad83b267"
 "checksum protobuf 1.2.2 (registry+https://github.com/rust-lang/crates.io-index)" = "c3e2ed6fe8ff3b20b44bb4b4f54de12ac89dc38cb451dce8ae5e9dcd1507f738"
-"checksum quick-error 0.2.2 (registry+https://github.com/rust-lang/crates.io-index)" = "7ac990ab4e038dd8481a5e3fd00641067fcfc674ad663f3222752ed5284e05d4"
 "checksum quick-error 1.2.0 (registry+https://github.com/rust-lang/crates.io-index)" = "3c36987d4978eb1be2e422b1e0423a557923a5c3e7e6f31d5699e9aafaefa469"
 "checksum quine-mc_cluskey 0.2.4 (registry+https://github.com/rust-lang/crates.io-index)" = "07589615d719a60c8dd8a4622e7946465dfef20d1a428f969e3443e7386d5f45"
 "checksum quote 0.3.15 (registry+https://github.com/rust-lang/crates.io-index)" = "7a6e920b65c65f10b2ae65c831a81a073a89edd28c7cce89475bff467ab4167a"

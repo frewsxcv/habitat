@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2017 Chef Software Inc. and/or applicable contributors
+// Copyright (c) 2016 Chef Software Inc. and/or applicable contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -55,18 +55,19 @@ impl fmt::Display for ProcessState {
     }
 }
 
-#[derive(Debug)]
 pub struct Supervisor {
     pub preamble: String,
     pub state: ProcessState,
     pub state_entered: Timespec,
+    launcher: LauncherCli,
     pid: Option<Pid>,
     pid_file: PathBuf,
 }
 
 impl Supervisor {
-    pub fn new(service_group: &ServiceGroup) -> Supervisor {
+    pub fn new(service_group: &ServiceGroup, launcher: LauncherCli) -> Supervisor {
         Supervisor {
+            launcher: launcher,
             preamble: service_group.to_string(),
             state: ProcessState::Down,
             state_entered: time::get_time(),
@@ -105,7 +106,6 @@ impl Supervisor {
         &mut self,
         pkg: &Pkg,
         group: &ServiceGroup,
-        launcher: &LauncherCli,
         svc_password: Option<T>,
     ) -> Result<()>
     where
@@ -113,7 +113,7 @@ impl Supervisor {
     {
         outputln!(preamble self.preamble,
             "Starting service as user={}, group={}", &pkg.svc_user, &pkg.svc_group);
-        let pid = launcher.spawn(
+        let pid = self.launcher.spawn(
             group.to_string(),
             &pkg.svc_run,
             &pkg.svc_user,
@@ -141,11 +141,11 @@ impl Supervisor {
         (healthy, status)
     }
 
-    pub fn stop(&mut self, launcher: &LauncherCli) -> Result<()> {
+    pub fn stop(&mut self) -> Result<()> {
         if self.pid.is_none() {
             return Ok(());
         }
-        launcher.terminate(self.pid.unwrap())?;
+        self.launcher.terminate(self.pid.unwrap())?;
         self.cleanup_pidfile();
         self.change_state(ProcessState::Down);
         Ok(())
@@ -155,7 +155,6 @@ impl Supervisor {
         &mut self,
         pkg: &Pkg,
         group: &ServiceGroup,
-        launcher: &LauncherCli,
         svc_password: Option<T>,
     ) -> Result<()>
     where
@@ -163,7 +162,7 @@ impl Supervisor {
     {
         match self.pid {
             Some(pid) => {
-                match launcher.restart(pid) {
+                match self.launcher.restart(pid) {
                     Ok(pid) => {
                         self.pid = Some(pid);
                         self.create_pidfile()?;
@@ -177,7 +176,7 @@ impl Supervisor {
                     }
                 }
             }
-            None => self.start(pkg, group, launcher, svc_password),
+            None => self.start(pkg, group, svc_password),
         }
     }
 
@@ -217,6 +216,21 @@ impl Supervisor {
         }
         self.state = state;
         self.state_entered = time::get_time();
+    }
+}
+
+impl fmt::Debug for Supervisor {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "Supervisor {{ preamble: {:?}, state: {:?}, state_entered: {:?}, pid: {:?}, \
+                pid_file: {:?} }}",
+            self.preamble,
+            self.state,
+            self.state_entered,
+            self.pid,
+            self.pid_file
+        )
     }
 }
 

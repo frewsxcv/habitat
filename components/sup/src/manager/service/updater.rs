@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 use std::thread;
 
@@ -21,7 +22,6 @@ use common::ui::UI;
 use env;
 use hcore::package::{PackageIdent, PackageInstall};
 use hcore::service::ServiceGroup;
-use launcher_client::LauncherCli;
 
 use census::CensusRing;
 use manager::periodic::Periodic;
@@ -61,13 +61,15 @@ enum FollowerState {
 }
 
 pub struct ServiceUpdater {
+    census_ring: Arc<RwLock<CensusRing>>,
     states: UpdaterStateList,
     butterfly: butterfly::Server,
 }
 
 impl ServiceUpdater {
-    pub fn new(butterfly: butterfly::Server) -> Self {
+    pub fn new(butterfly: butterfly::Server, census: Arc<RwLock<CensusRing>>) -> Self {
         ServiceUpdater {
+            census_ring: census,
             states: UpdaterStateList::default(),
             butterfly: butterfly,
         }
@@ -97,24 +99,18 @@ impl ServiceUpdater {
         }
     }
 
-    // TODO (CM): How do we remove something from the updater? e.g.,
-    // when we stop or unload a service?
-
     /// See if the given service has an update. Returns `true` if a
     /// new version was installed, thus signalling that the service
     /// should be restarted
-    pub fn check_for_updated_package(
-        &mut self,
-        service: &mut Service,
-        census_ring: &CensusRing,
-        launcher: &LauncherCli,
-    ) -> bool {
+    pub fn check_for_updated_package(&mut self, service: &mut Service) -> bool {
+        // TODO (CM): How do we remove something from the updater? e.g.,
+        // when we stop or unload a service?
         let mut updated = false;
         match self.states.get_mut(&service.service_group) {
             Some(&mut UpdaterState::AtOnce(ref mut rx)) => {
                 match rx.try_recv() {
                     Ok(package) => {
-                        service.update_package(package, launcher);
+                        service.update_package(package);
                         return true;
                     }
                     Err(TryRecvError::Empty) => return false,
@@ -124,8 +120,8 @@ impl ServiceUpdater {
                     }
                 }
             }
-
             Some(&mut UpdaterState::Rolling(ref mut st @ RollingState::AwaitingElection)) => {
+                let census_ring = self.census_ring.read().unwrap();
                 if let Some(census_group) = census_ring.census_group_for(&service.service_group) {
                     if service.topology == Topology::Leader {
                         debug!(
@@ -160,6 +156,7 @@ impl ServiceUpdater {
                 }
             }
             Some(&mut UpdaterState::Rolling(ref mut st @ RollingState::InElection)) => {
+                let census_ring = self.census_ring.read().unwrap();
                 if let Some(census_group) = census_ring.census_group_for(&service.service_group) {
                     match (census_group.me(), census_group.update_leader()) {
                         (Some(me), Some(leader)) => {
@@ -184,7 +181,7 @@ impl ServiceUpdater {
                         match rx.try_recv() {
                             Ok(package) => {
                                 debug!("Rolling Update, polling found a new package");
-                                service.update_package(package, launcher);
+                                service.update_package(package);
                                 updated = true;
                             }
                             Err(TryRecvError::Empty) => return false,
@@ -195,6 +192,7 @@ impl ServiceUpdater {
                         }
                     }
                     LeaderState::Waiting => {
+                        let census_ring = self.census_ring.read().unwrap();
                         match census_ring.census_group_for(&service.service_group) {
                             Some(census_group) => {
                                 if census_group.members().iter().any(|cm| {
@@ -224,6 +222,7 @@ impl ServiceUpdater {
             Some(&mut UpdaterState::Rolling(RollingState::Follower(ref mut state))) => {
                 match *state {
                     FollowerState::Waiting => {
+                        let census_ring = self.census_ring.read().unwrap();
                         match census_ring.census_group_for(&service.service_group) {
                             Some(census_group) => {
                                 match (
@@ -259,11 +258,12 @@ impl ServiceUpdater {
                         }
                     }
                     FollowerState::Updating(ref mut rx) => {
+                        let census_ring = self.census_ring.read().unwrap();
                         match census_ring.census_group_for(&service.service_group) {
                             Some(census_group) => {
                                 match rx.try_recv() {
                                     Ok(package) => {
-                                        service.update_package(package, launcher);
+                                        service.update_package(package);
                                         updated = true
                                     }
                                     Err(TryRecvError::Empty) => return false,

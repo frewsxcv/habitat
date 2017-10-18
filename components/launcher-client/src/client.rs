@@ -13,110 +13,46 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-use std::io;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 
 use core::os::process::Pid;
-use ipc_channel::ipc::{IpcOneShotServer, IpcReceiver, IpcSender};
 use protobuf;
 use protocol;
+use zmq;
 
 use error::{Error, Result};
+use manager::{IS_STOPPING, MGR_INPROC};
 
 type Env = HashMap<String, String>;
-type IpcServer = IpcOneShotServer<Vec<u8>>;
 
 pub struct LauncherCli {
-    tx: IpcSender<Vec<u8>>,
-    rx: IpcReceiver<Vec<u8>>,
+    msg_buf: zmq::Message,
+    sock: zmq::Socket,
 }
 
 impl LauncherCli {
-    pub fn connect(pipe: String) -> Result<Self> {
-        let tx = IpcSender::connect(pipe).map_err(Error::Connect)?;
-        let (ipc_srv, pipe) = IpcServer::new().map_err(Error::BadPipe)?;
-        let mut cmd = protocol::Register::new();
-        cmd.set_pipe(pipe);
-        Self::send(&tx, &cmd)?;
-        let (rx, raw) = ipc_srv.accept().map_err(|_| Error::AcceptConn)?;
-        Self::read::<protocol::NetOk>(&raw)?;
-        Ok(LauncherCli { tx: tx, rx: rx })
-    }
-
-    /// Read a launcher protocol message from a byte array
-    fn read<T>(bytes: &[u8]) -> Result<T>
-    where
-        T: protobuf::MessageStatic,
-    {
-        let txn = protocol::NetTxn::from_bytes(bytes).map_err(
-            Error::Deserialize,
-        )?;
-        if txn.message_id() == "NetErr" {
-            let err = txn.decode::<protocol::NetErr>().map_err(Error::Deserialize)?;
-            return Err(Error::Protocol(err));
-        }
-        let msg = txn.decode::<T>().map_err(Error::Deserialize)?;
-        Ok(msg)
-    }
-
-    /// Receive and read protocol message from an IpcReceiver
-    fn recv<T>(rx: &IpcReceiver<Vec<u8>>) -> Result<T>
-    where
-        T: protobuf::MessageStatic,
-    {
-        match rx.recv() {
-            Ok(bytes) => Self::read(&bytes),
-            Err(err) => Err(Error::from(*err)),
-        }
-    }
-
-    /// Send a command to a Launcher
-    fn send<T>(tx: &IpcSender<Vec<u8>>, message: &T) -> Result<()>
-    where
-        T: protobuf::MessageStatic,
-    {
-        let txn = protocol::NetTxn::build(message).map_err(Error::Serialize)?;
-        let bytes = txn.to_bytes().map_err(Error::Serialize)?;
-        tx.send(bytes).map_err(Error::Send)?;
-        Ok(())
-    }
-
-    /// Receive and read protocol message from an IpcReceiver
-    fn try_recv<T>(rx: &IpcReceiver<Vec<u8>>) -> Result<Option<T>>
-    where
-        T: protobuf::MessageStatic,
-    {
-        match rx.try_recv().map_err(|err| Error::from(*err)) {
-            Ok(bytes) => {
-                let msg = Self::read::<T>(&bytes)?;
-                Ok(Some(msg))
-            }
-            Err(Error::IPCIO(io::ErrorKind::WouldBlock)) => Ok(None),
-            Err(err) => Err(err),
-        }
-    }
-
-    pub fn is_stopping(&self) -> bool {
-        match Self::try_recv::<protocol::Shutdown>(&self.rx) {
-            Ok(Some(_)) |
-            Err(Error::IPCIO(_)) => true,
-            Ok(None) => false,
-            Err(err) => panic!("Unexpected error checking for shutdown request, {}", err),
-        }
+    pub fn connect(context: &mut zmq::Context) -> Result<Self> {
+        let sock = context.socket(zmq::REQ)?;
+        sock.connect(MGR_INPROC)?;
+        Ok(LauncherCli {
+            msg_buf: zmq::Message::new()?,
+            sock: sock,
+        })
     }
 
     /// Restart a running process with the same arguments
-    pub fn restart(&self, pid: Pid) -> Result<Pid> {
+    pub fn restart(&mut self, pid: Pid) -> Result<Pid> {
         let mut msg = protocol::Restart::new();
         msg.set_pid(pid.into());
-        Self::send(&self.tx, &msg)?;
-        let reply = Self::recv::<protocol::SpawnOk>(&self.rx)?;
+        self.send(&msg)?;
+        let reply = self.wait_recv::<protocol::SpawnOk>()?;
         Ok(reply.get_pid() as Pid)
     }
 
     /// Send a process spawn command to the connected Launcher
     pub fn spawn<I, B, U, G, P>(
-        &self,
+        &mut self,
         id: I,
         bin: B,
         user: U,
@@ -140,16 +76,59 @@ impl LauncherCli {
         }
         msg.set_env(env);
         msg.set_id(id.to_string());
-        Self::send(&self.tx, &msg)?;
-        let reply = Self::recv::<protocol::SpawnOk>(&self.rx)?;
+        self.send(&msg)?;
+        let reply = self.wait_recv::<protocol::SpawnOk>()?;
         Ok(reply.get_pid() as Pid)
     }
 
-    pub fn terminate(&self, pid: Pid) -> Result<i32> {
+    pub fn terminate(&mut self, pid: Pid) -> Result<i32> {
         let mut msg = protocol::Terminate::new();
         msg.set_pid(pid.into());
-        Self::send(&self.tx, &msg)?;
-        let reply = Self::recv::<protocol::TerminateOk>(&self.rx)?;
+        self.send(&msg)?;
+        let reply = self.wait_recv::<protocol::TerminateOk>()?;
         Ok(reply.get_exit_code())
     }
+
+    /// Send a command to a Launcher
+    fn send<T>(&self, message: &T) -> Result<()>
+    where
+        T: protobuf::MessageStatic,
+    {
+        let txn = protocol::NetTxn::build(message).map_err(Error::Serialize)?;
+        let bytes = txn.to_bytes().map_err(Error::Serialize)?;
+        self.sock.send(&bytes, 0).map_err(Error::Socket)?;
+        Ok(())
+    }
+
+    /// Receive and read protocol message from an IpcReceiver
+    fn wait_recv<T>(&mut self) -> Result<T>
+    where
+        T: protobuf::MessageStatic,
+    {
+        self.sock.recv(&mut self.msg_buf, 0)?;
+        read_msg(&*self.msg_buf)
+    }
+}
+
+/// Read a launcher protocol message from a byte array
+pub fn read_msg<T>(bytes: &[u8]) -> Result<T>
+where
+    T: protobuf::MessageStatic,
+{
+    let txn = protocol::NetTxn::from_bytes(bytes).map_err(
+        Error::Deserialize,
+    )?;
+    if txn.message_id() == "NetErr" {
+        let err = txn.decode::<protocol::NetErr>().map_err(Error::Deserialize)?;
+        return Err(Error::Protocol(err));
+    }
+    if txn.message_id() == "Shutdown" {
+        IS_STOPPING.store(true, Ordering::SeqCst);
+        txn.decode::<protocol::Shutdown>().map_err(
+            Error::Deserialize,
+        )?;
+        return Err(Error::Shutdown);
+    }
+    let msg = txn.decode::<T>().map_err(Error::Deserialize)?;
+    Ok(msg)
 }

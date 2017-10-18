@@ -22,6 +22,7 @@ use std::result;
 use ipc_channel;
 use protobuf;
 use protocol;
+use zmq;
 
 #[derive(Debug)]
 pub enum Error {
@@ -34,6 +35,8 @@ pub enum Error {
     Protocol(protocol::NetErr),
     Send(ipc_channel::Error),
     Serialize(protobuf::ProtobufError),
+    Shutdown,
+    Socket(zmq::Error),
 }
 
 pub type Result<T> = result::Result<T, Error>;
@@ -54,6 +57,8 @@ impl fmt::Display for Error {
             Error::Protocol(ref e) => format!("{}", e),
             Error::Send(ref e) => format!("Unable to send to Launcher's pipe, {}", e),
             Error::Serialize(ref e) => format!("Unable to serialize message to Launcher, {}", e),
+            Error::Shutdown => format!("Launcher is shutting down"),
+            Error::Socket(ref e) => format!("{}", e),
         };
         write!(f, "{}", msg)
     }
@@ -71,6 +76,8 @@ impl error::Error for Error {
             Error::Protocol(_) => "Received an error from Launcher",
             Error::Send(_) => "Unable to send to Launcher's pipe",
             Error::Serialize(_) => "Unable to serialize message to Launcher",
+            Error::Shutdown => "Launcher is shutting down",
+            Error::Socket(ref err) => err.description(),
         }
     }
 }
@@ -81,5 +88,11 @@ impl From<bincode::internal::ErrorKind> for Error {
             bincode::internal::ErrorKind::IoError(io) => Error::IPCIO(io.kind()),
             _ => Error::IPCBincode(err.to_string()),
         }
+    }
+}
+
+impl From<zmq::Error> for Error {
+    fn from(err: zmq::Error) -> Error {
+        Error::Socket(err)
     }
 }

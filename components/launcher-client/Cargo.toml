@@ -11,3 +11,4 @@ ipc-channel = { git = "https://github.com/habitat-sh/ipc-channel", branch = "hbt
 libc = "*"
 protobuf = "*"
 serde = "*"
+zmq = { git = "https://github.com/erickt/rust-zmq", branch = "release/v0.8" }

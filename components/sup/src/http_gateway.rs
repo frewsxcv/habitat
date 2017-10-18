@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2017 Chef Software Inc. and/or applicable contributors
+// Copyright (c) 2016 Chef Software Inc. and/or applicable contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,63 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
 use std::fmt;
-use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs, SocketAddr, SocketAddrV4};
 use std::ops::{Deref, DerefMut};
 use std::option;
-use std::path::Path;
 use std::result;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use hcore::service::{ApplicationEnvironment, ServiceGroup};
 use iron::prelude::*;
-use iron::{headers, status, typemap};
+use iron::{headers, status};
 use iron::modifiers::Header;
-use persistent;
-use prometheus::{self, CounterVec, HistogramVec, TextEncoder, Encoder};
 use router::Router;
-use serde_json::{self, Value as Json};
+use serde::Serialize;
+use serde_json;
 
 use error::{Result, Error, SupError};
-use manager;
+use manager::Manager;
 use manager::service::HealthCheck;
-use manager::service::hooks::{self, HealthCheckHook};
 
 static LOGKEY: &'static str = "HG";
 const APIDOCS: &'static str = include_str!(concat!(env!("OUT_DIR"), "/api.html"));
-
-// Simple macro to encapsulate the HTTP metrics for each endpoint
-macro_rules! with_metrics {
-    ($method:expr, $name:expr) => {{
-        let mut labels = HashMap::new();
-        labels.insert("handler", $name);
-
-        HTTP_COUNTER.with(&labels.clone()).inc();
-        let timer = HTTP_REQ_HISTOGRAM.with(&labels).start_timer();
-        let result = $method;
-        timer.observe_duration();
-        result
-    }}
-}
-
-lazy_static! {
-    static ref HTTP_COUNTER: CounterVec = register_counter_vec!(
-        opts!(
-            "http_requests_total",
-            "Total number of HTTP requests made."),
-        &["handler"]).unwrap();
-
-    static ref HTTP_REQ_HISTOGRAM: HistogramVec = register_histogram_vec!(
-        histogram_opts!(
-            "http_request_duration_seconds",
-            "HTTP request latencies in seconds."),
-        &["handler"]).unwrap();
-}
 
 #[derive(PartialEq, Eq, Debug, Clone)]
 pub struct ListenAddr(SocketAddr);
@@ -135,43 +101,27 @@ impl fmt::Display for ListenAddr {
     }
 }
 
-struct ManagerFs;
-
-impl typemap::Key for ManagerFs {
-    type Value = manager::FsCfg;
-}
-
-pub struct Server(Iron<Chain>, ListenAddr);
+pub struct Server(Iron<Router>, ListenAddr);
 
 impl Server {
-    pub fn new(manager_state: Arc<manager::FsCfg>, listen_addr: ListenAddr) -> Self {
+    pub fn new(listen_addr: ListenAddr) -> Self {
         let router =
             router!(
-            doc: get "/" => with_metrics!(doc, "doc"),
-            butterfly: get "/butterfly" => with_metrics!(butterfly, "butterfly"),
-            census: get "/census" => with_metrics!(census, "census"),
-            metrics: get "/metrics" => with_metrics!(metrics, "metrics"),
-            services: get "/services" => with_metrics!(services, "services"),
-            service: get "/services/:svc/:group" => {
-                with_metrics!(service, "service")
-            },
-            service_org: get "/services/:svc/:group/:org" => {
-                with_metrics!(service, "service")
-            },
-            service_config: get "/services/:svc/:group/config" => {
-                with_metrics!(config, "config")
-            },
-            service_health: get "/services/:svc/:group/health" => with_metrics!(health, "health"),
-            service_config_org: get "/services/:svc/:group/:org/config" => {
-                with_metrics!(config, "config")
-            },
-            service_health_org: get "/services/:svc/:group/:org/health" => {
-                with_metrics!(health, "config")
-            }
+            doc: get "/" => doc,
+            butterfly: get "/butterfly" => butterfly,
+            census: get "/census" => census,
+            services: get "/services" => services,
+            services_mut: post "/services" => services_mut,
+            service: get "/services/:svc/:group" => service,
+            service_mut: post "/services/:svc/:group" => service_mut,
+            service_org: get "/services/:svc/:group/:org" => service,
+            service_org_mut: post "/services/:svc/:group/:org" => service_mut,
+            service_config: get "/services/:svc/:group/config" => config,
+            service_health: get "/services/:svc/:group/health" => health,
+            service_config_org: get "/services/:svc/:group/:org/config" => config,
+            service_health_org: get "/services/:svc/:group/:org/health" => health,
         );
-        let mut chain = Chain::new(router);
-        chain.link(persistent::Read::<ManagerFs>::both(manager_state));
-        Server(Iron::new(chain), listen_addr)
+        Server(Iron::new(router), listen_addr)
     }
 
     pub fn start(self) -> Result<JoinHandle<()>> {
@@ -193,105 +143,20 @@ struct HealthCheckBody {
 }
 
 fn butterfly(req: &mut Request) -> IronResult<Response> {
-    let state = req.get::<persistent::Read<ManagerFs>>().unwrap();
-    match File::open(&state.butterfly_data_path) {
-        Ok(file) => Ok(Response::with(
-            (status::Ok, Header(headers::ContentType::json()), file),
-        )),
-        Err(_) => Ok(Response::with(status::ServiceUnavailable)),
-    }
+    let mgr = Manager::connect().unwrap();
+    render(mgr.butterfly())
 }
 
 fn census(req: &mut Request) -> IronResult<Response> {
-    let state = req.get::<persistent::Read<ManagerFs>>().unwrap();
-    match File::open(&state.census_data_path) {
-        Ok(file) => Ok(Response::with(
-            (status::Ok, Header(headers::ContentType::json()), file),
-        )),
-        Err(_) => Ok(Response::with(status::ServiceUnavailable)),
-    }
+    let mgr = Manager::connect().unwrap();
+    render(mgr.census())
 }
 
 fn config(req: &mut Request) -> IronResult<Response> {
-    let state = req.get::<persistent::Read<ManagerFs>>().unwrap();
-    let service_group = match build_service_group(req) {
-        Ok(sg) => sg,
-        Err(_) => return Ok(Response::with(status::BadRequest)),
-    };
-    match service_from_file(&service_group, &state.services_data_path) {
-        Ok(Some(service)) => {
-            Ok(Response::with((
-                status::Ok,
-                Header(headers::ContentType::json()),
-                service["cfg"].to_string(),
-            )))
-        }
-        Ok(None) => Ok(Response::with(status::NotFound)),
-        Err(_) => Ok(Response::with(status::ServiceUnavailable)),
-    }
-}
-
-fn health(req: &mut Request) -> IronResult<Response> {
-    let state = req.get::<persistent::Read<ManagerFs>>().unwrap();
-    let (health_file, stdout_path, stderr_path) = match build_service_group(req) {
-        Ok(sg) => {
-            (
-                state.health_check_cache(&sg),
-                hooks::stdout_log_path::<HealthCheckHook>(&sg),
-                hooks::stderr_log_path::<HealthCheckHook>(&sg),
-            )
-        }
-        Err(_) => return Ok(Response::with(status::BadRequest)),
-    };
-    match File::open(&health_file) {
-        Ok(mut file) => {
-            let mut buf = String::new();
-            let mut body = HealthCheckBody::default();
-            file.read_to_string(&mut buf).unwrap();
-            let code = i8::from_str(buf.trim()).unwrap();
-            let status: status::Status = HealthCheck::from(code).into();
-            if let Ok(mut file) = File::open(&stdout_path) {
-                let _ = file.read_to_string(&mut body.stdout);
-            }
-            if let Ok(mut file) = File::open(&stderr_path) {
-                let _ = file.read_to_string(&mut body.stderr);
-            }
-            Ok(Response::with((
-                status,
-                Header(headers::ContentType::json()),
-                serde_json::to_string(&body).unwrap(),
-            )))
-        }
-        Err(_) => Ok(Response::with(status::NotFound)),
-    }
-}
-
-fn service(req: &mut Request) -> IronResult<Response> {
-    let state = req.get::<persistent::Read<ManagerFs>>().unwrap();
-    let service_group = match build_service_group(req) {
-        Ok(sg) => sg,
-        Err(_) => return Ok(Response::with(status::BadRequest)),
-    };
-    match service_from_file(&service_group, &state.services_data_path) {
-        Ok(Some(service)) => {
-            Ok(Response::with((
-                status::Ok,
-                Header(headers::ContentType::json()),
-                service.to_string(),
-            )))
-        }
-        Ok(None) => Ok(Response::with(status::NotFound)),
-        Err(_) => Ok(Response::with(status::ServiceUnavailable)),
-    }
-}
-
-fn services(req: &mut Request) -> IronResult<Response> {
-    let state = req.get::<persistent::Read<ManagerFs>>().unwrap();
-    match File::open(&state.services_data_path) {
-        Ok(file) => Ok(Response::with(
-            (status::Ok, Header(headers::ContentType::json()), file),
-        )),
-        Err(_) => Ok(Response::with(status::ServiceUnavailable)),
+    let mgr = Manager::connect().unwrap();
+    match build_service_group(req) {
+        Ok(sg) => render(mgr.config(&sg)),
+        Err(_) => Ok(Response::with(status::BadRequest)),
     }
 }
 
@@ -301,32 +166,59 @@ fn doc(_req: &mut Request) -> IronResult<Response> {
     ))
 }
 
-fn metrics(_req: &mut Request) -> IronResult<Response> {
-    let mut buffer = vec![];
-    let encoder = TextEncoder::new();
-    let metric_familys = prometheus::gather();
-    encoder.encode(&metric_familys, &mut buffer).unwrap();
-
-    Ok(Response::with(
-        (status::Ok, String::from_utf8(buffer).unwrap()),
-    ))
-}
-
-impl Into<Response> for HealthCheck {
-    fn into(self) -> Response {
-        let status: status::Status = self.into();
-        Response::with(status)
+fn health(req: &mut Request) -> IronResult<Response> {
+    let mgr = Manager::connect().unwrap();
+    match build_service_group(req) {
+        Ok(sg) => render(mgr.health(&sg)),
+        Err(_) => Ok(Response::with(status::BadRequest)),
     }
 }
 
-impl Into<status::Status> for HealthCheck {
-    fn into(self) -> status::Status {
-        match self {
-            HealthCheck::Ok | HealthCheck::Warning => status::Ok,
-            HealthCheck::Critical => status::ServiceUnavailable,
-            HealthCheck::Unknown => status::InternalServerError,
+fn render<T>(result: Result<T>) -> IronResult<Response>
+where
+    T: Serialize,
+{
+    match result {
+        Ok(data) => Ok(Response::with((
+            status::Ok,
+            Header(headers::ContentType::json()),
+            serde_json::to_string(&data).unwrap(),
+        ))),
+        Err(err) => {
+            // JW TODO: map these errors - check if this error is ENTITY_NOT_FOUND
+            error!("{}", err);
+            Ok(Response::with(status::ServiceUnavailable))
         }
     }
+}
+
+fn service(req: &mut Request) -> IronResult<Response> {
+    let mgr = Manager::connect().unwrap();
+    match build_service_group(req) {
+        Ok(sg) => render(mgr.service(&sg)),
+        Err(_) => Ok(Response::with(status::BadRequest)),
+    }
+}
+
+fn service_mut(req: &mut Request) -> IronResult<Response> {
+    // parse params to figure out what this user is doing
+    // authenticate request
+    // match on those params to form a message
+    let mgr = Manager::connect().unwrap();
+    Ok(Response::with(status::Ok))
+}
+
+fn services(req: &mut Request) -> IronResult<Response> {
+    let mgr = Manager::connect().unwrap();
+    render(mgr.services())
+}
+
+fn services_mut(req: &mut Request) -> IronResult<Response> {
+    // parse params to figure out what this user is doing
+    // authenticate request
+    // match on those params to form a message
+    let mgr = Manager::connect().unwrap();
+    Ok(Response::with(status::Ok))
 }
 
 fn build_service_group(req: &mut Request) -> Result<ServiceGroup> {
@@ -358,24 +250,19 @@ fn build_service_group(req: &mut Request) -> Result<ServiceGroup> {
     Ok(sg)
 }
 
-fn service_from_file<T>(
-    service_group: &ServiceGroup,
-    services_data_path: T,
-) -> result::Result<Option<Json>, io::Error>
-where
-    T: AsRef<Path>,
-{
-    match File::open(services_data_path) {
-        Ok(file) => {
-            match serde_json::from_reader(file) {
-                Ok(Json::Array(services)) => {
-                    Ok(services.into_iter().find(|s| {
-                        s["service_group"] == service_group.as_ref()
-                    }))
-                }
-                _ => Ok(None),
-            }
+impl Into<Response> for HealthCheck {
+    fn into(self) -> Response {
+        let status: status::Status = self.into();
+        Response::with(status)
+    }
+}
+
+impl Into<status::Status> for HealthCheck {
+    fn into(self) -> status::Status {
+        match self {
+            HealthCheck::Ok | HealthCheck::Warning => status::Ok,
+            HealthCheck::Critical => status::ServiceUnavailable,
+            HealthCheck::Unknown => status::InternalServerError,
         }
-        Err(err) => Err(err),
     }
 }

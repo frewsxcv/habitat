@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2017 Chef Software Inc. and/or applicable contributors
+// Copyright (c) 2016 Chef Software Inc. and/or applicable contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -64,8 +64,6 @@ extern crate libc;
 extern crate log;
 extern crate notify;
 extern crate persistent;
-#[macro_use]
-extern crate prometheus;
 extern crate protobuf;
 extern crate rand;
 extern crate regex;
@@ -82,6 +80,7 @@ extern crate tempdir;
 extern crate time;
 extern crate toml;
 extern crate url;
+extern crate zmq;
 
 #[macro_export]
 /// Creates a new SupError, embedding the current file name, line number, column, and module path.
@@ -105,13 +104,24 @@ pub mod templating;
 pub mod util;
 mod sys;
 
+use std::cell::UnsafeCell;
 use std::env;
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 
 lazy_static!{
     pub static ref PROGRAM_NAME: String = {
         let arg0 = env::args().next().map(|p| PathBuf::from(p));
         arg0.as_ref().and_then(|p| p.file_stem()).and_then(|p| p.to_str()).unwrap().to_string()
+    };
+
+    /// A threadsafe shared ZMQ context for consuming services.
+    ///
+    /// You probably want to use this context to create new ZMQ sockets unless you *do not* want to
+    /// connect them together using an in-proc queue.
+    pub static ref SOCKET_CONTEXT: Box<SocketContext> = {
+        let ctx = SocketContext(UnsafeCell::new(zmq::Context::new()));
+        Box::new(ctx)
     };
 }
 
@@ -123,3 +133,24 @@ features! {
 
 pub const PRODUCT: &'static str = "hab-sup";
 pub const VERSION: &'static str = include_str!(concat!(env!("OUT_DIR"), "/VERSION"));
+
+/// This is a wrapper to provide interior mutability of an underlying `zmq::Context` and allows
+/// for sharing/sending of a `zmq::Context` between threads.
+pub struct SocketContext(UnsafeCell<zmq::Context>);
+
+impl Deref for SocketContext {
+    type Target = zmq::Context;
+
+    fn deref(&self) -> &zmq::Context {
+        unsafe { &*self.0.get() }
+    }
+}
+
+impl DerefMut for SocketContext {
+    fn deref_mut(&mut self) -> &mut zmq::Context {
+        unsafe { &mut *self.0.get() }
+    }
+}
+
+unsafe impl Send for SocketContext {}
+unsafe impl Sync for SocketContext {}

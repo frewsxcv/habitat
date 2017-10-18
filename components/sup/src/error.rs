@@ -142,6 +142,7 @@ pub enum Error {
     NotifyCreateError(notify::Error),
     NotifyError(notify::Error),
     NulError(ffi::NulError),
+    OpenPipe(io::Error),
     PackageNotFound(package::PackageIdent),
     Permissions(String),
     PidFileCorrupt(PathBuf),
@@ -184,7 +185,14 @@ impl fmt::Display for SupError {
             }
             Error::Departed => {
                 format!(
-                    "This Supervisor has been manually departed.\n\nFor the safety of the system, this Supervisor cannot be started (if we did, we would risk the services on this machine behaving badly without our knowledge.) If you know that the services on this system are safe, and want them to rejoin the habitat ring, you need to:\n\n  rm -rf /hab/sup/default/MEMBER_ID /hab/sup/default/data\n\nThis will cause the Supervisor to join the ring as a new member.\n\nIf you are in doubt, it is better to consider the services managed by this Supervisor as unsafe to run."
+                    "This Supervisor has been manually departed.\n\nFor the safety of the system, \
+                    this Supervisor cannot be started (if we did, we would risk the services on \
+                    this machine behaving badly without our knowledge.) If you know that the \
+                    services on this system are safe, and want them to rejoin the habitat ring, \
+                    you need to:\n\n  rm -rf /hab/sup/default/MEMBER_ID \
+                    /hab/sup/default/data\n\nThis will cause the Supervisor to join the ring as a \
+                    new member.\n\nIf you are in doubt, it is better to consider the services \
+                    managed by this Supervisor as unsafe to run."
                 )
             }
             Error::BadDataFile(ref path, ref err) => {
@@ -240,9 +248,10 @@ impl fmt::Display for SupError {
             Error::InvalidBinds(ref e) => format!("Invalid bind(s), {}", e.join(", ")),
             Error::InvalidCompositeBinding(ref binding) => {
                 format!(
-                    "Invalid binding \"{}\", must be of the form <SERVICE_NAME>:<NAME>:<SERVICE_GROUP> where \
-                     <SERVICE_NAME> is the name of a service within the composite, <NAME> is a bind name for \
-                     that service, and <SERVICE_GROUP> is a valid service group",
+                    "Invalid binding \"{}\", must be of the form \
+                    <SERVICE_NAME>:<NAME>:<SERVICE_GROUP> where <SERVICE_NAME> is the name of a \
+                    service within the composite, <NAME> is a bind name for that service, and \
+                    <SERVICE_GROUP> is a valid service group",
                     binding
                 )
             }
@@ -267,6 +276,7 @@ impl fmt::Display for SupError {
             Error::NotifyCreateError(ref e) => format!("Notify create error: {}", e),
             Error::NotifyError(ref e) => format!("Notify error: {}", e),
             Error::NulError(ref e) => format!("{}", e),
+            Error::OpenPipe(ref e) => format!("Unable to open Supervisor's comm channel, {}", e),
             Error::PackageNotFound(ref pkg) => {
                 if pkg.fully_qualified() {
                     format!("Cannot find package: {}", pkg)
@@ -405,6 +415,7 @@ impl error::Error for SupError {
             Error::NulError(_) => {
                 "An attempt was made to build a CString with a null byte inside it"
             }
+            Error::OpenPipe(_) => "Unable to open Supervisors's pipe",
             Error::PackageNotFound(_) => "Cannot find a package",
             Error::Permissions(_) => "File system permissions error",
             Error::PidFileCorrupt(_) => "Unable to decode contents of PID file",
