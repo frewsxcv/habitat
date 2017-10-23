@@ -22,7 +22,7 @@ import { requireSignIn, packageString } from '../../util';
 import {
   fetchOrigin, fetchOriginInvitations, fetchOriginMembers, inviteUserToOrigin, filterPackagesBy,
   fetchMyOrigins, requestRoute, setCurrentProject, getUniquePackages,
-  fetchDockerIntegration, fetchProjects
+  fetchIntegrations, fetchProjects
 } from '../../actions';
 
 @Component({
@@ -45,7 +45,7 @@ export class OriginPageComponent implements OnInit, OnDestroy {
     requireSignIn(this);
     this.store.dispatch(fetchOrigin(this.origin.name));
     this.store.dispatch(fetchMyOrigins(this.token));
-    this.store.dispatch(fetchDockerIntegration(this.origin.name, this.token));
+    this.store.dispatch(fetchIntegrations(this.origin.name, this.token));
     this.getPackages();
     this.getProjects();
     this.loadPackages = this.getPackages.bind(this);

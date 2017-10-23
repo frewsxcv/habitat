@@ -28,7 +28,7 @@ export class OriginPackagesTabComponent {
   constructor(private store: AppStore, private router: Router) { }
 
   get integrations() {
-    return this.store.getState().origins.currentIntegrations.docker;
+    return this.store.getState().origins.currentIntegrations.integrations;
   }
 
   get origin() {

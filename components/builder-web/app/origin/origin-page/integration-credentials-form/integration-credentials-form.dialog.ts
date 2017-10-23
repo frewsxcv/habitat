@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { Component, OnDestroy } from '@angular/core';
-import { MatDialog, MatDialogRef } from '@angular/material';
+import { Component, OnDestroy, Inject } from '@angular/core';
+import { MatDialog, MatDialogRef, MAT_DIALOG_DATA } from '@angular/material';
 import { AppStore } from '../../../app.store';
-import { clearIntegrationCredsValidation, validateDockerCredentials } from '../../../actions/index';
+import { clearIntegrationCredsValidation, validateIntegrationCredentials } from '../../../actions/index';
 
 export interface Credentials {
   username: string;
@@ -28,16 +28,17 @@ export class Credentials implements Credentials {
 }
 
 @Component({
-  selector: 'hab-docker-credentials-dialog',
-  template: require('./docker-credentials-form.dialog.html')
+  selector: 'hab-integration-credentials-dialog',
+  template: require('./integration-credentials-form.dialog.html')
 })
-export class DockerCredentialsFormDialog implements OnDestroy {
+export class IntegrationCredentialsFormDialog implements OnDestroy {
   model: Credentials = new Credentials;
 
   constructor(
-    public dialogRef: MatDialogRef<DockerCredentialsFormDialog>,
+    public dialogRef: MatDialogRef<IntegrationCredentialsFormDialog>,
+    @Inject(MAT_DIALOG_DATA) public data: any,
     private store: AppStore
-  ) {}
+  ) { }
 
   ngOnDestroy() {
     this.store.dispatch(clearIntegrationCredsValidation());
@@ -85,7 +86,7 @@ export class DockerCredentialsFormDialog implements OnDestroy {
   }
 
   onSubmit() {
-    this.store.dispatch(validateDockerCredentials(this.model.username, this.model.password, this.token));
+    this.store.dispatch(validateIntegrationCredentials(this.model.username, this.model.password, this.token, this.data.type));
     let unsubscribe;
 
     unsubscribe = this.store.subscribe(state => {
