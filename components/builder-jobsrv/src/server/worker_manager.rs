@@ -353,8 +353,15 @@ impl WorkerMgr {
     fn dispatch_job(&mut self, job: &Job, worker_ident: &str) -> Result<()> {
         debug!("Dispatching job to worker {:?}: {:?}", worker_ident, job);
 
+        let mut wc = jobsrv::WorkerCommand::new();
+        wc.set_op(jobsrv::WorkerOperation::StartJob);
+
         self.rq_sock.send_str(&worker_ident, zmq::SNDMORE)?;
         self.rq_sock.send(&[], zmq::SNDMORE)?;
+        self.rq_sock.send(
+            &wc.write_to_bytes().unwrap(),
+            zmq::SNDMORE,
+        )?;
         self.rq_sock.send(&job.write_to_bytes().unwrap(), 0)?;
 
         Ok(())
@@ -495,9 +502,13 @@ impl WorkerMgr {
                 match job.get_state() {
                     jobsrv::JobState::Pending |
                     jobsrv::JobState::Processing |
-                    jobsrv::JobState::Dispatched => false,
+                    jobsrv::JobState::Dispatched |
+                    jobsrv::JobState::CancelPending |
+                    jobsrv::JobState::CancelProcessing => false,
+
                     jobsrv::JobState::Complete |
                     jobsrv::JobState::Failed |
+                    jobsrv::JobState::CancelComplete |
                     jobsrv::JobState::Rejected => true,
                 }
             }

@@ -663,6 +663,7 @@ impl DataStore {
             jobsrv::JobGroupState::GroupComplete => "Complete",
             jobsrv::JobGroupState::GroupFailed => "Failed",
             jobsrv::JobGroupState::GroupQueued => "Queued",
+            jobsrv::JobGroupState::GroupCanceled => "Canceled",
         };
         conn.execute(
             "SELECT set_group_state_v1($1, $2)",
@@ -684,6 +685,7 @@ impl DataStore {
             jobsrv::JobGroupProjectState::Success => "Success",
             jobsrv::JobGroupProjectState::Failure => "Failure",
             jobsrv::JobGroupProjectState::Skipped => "Skipped",
+            jobsrv::JobGroupProjectState::Canceled => "Canceled",
         };
         conn.execute(
             "SELECT set_group_project_name_state_v1($1, $2, $3)",
@@ -715,6 +717,9 @@ impl DataStore {
             jobsrv::JobState::Pending |
             jobsrv::JobState::Processing |
             jobsrv::JobState::Dispatched => "InProgress",
+            jobsrv::JobState::CancelPending |
+            jobsrv::JobState::CancelProcessing |
+            jobsrv::JobState::CancelComplete => "Canceled",
         };
 
         if job.get_state() == jobsrv::JobState::Complete {

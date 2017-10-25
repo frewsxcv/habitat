@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use hab_net;
 use hab_net::socket::DEFAULT_CONTEXT;
-use protocol::{self, message};
+use protocol::{message, jobsrv};
 use zmq;
 
 use config::Config;
@@ -116,24 +116,48 @@ impl Server {
             if fe_msg {
                 self.fe_sock.recv(&mut self.msg, 0)?;
                 self.fe_sock.recv(&mut self.msg, 0)?;
+
+                let wc = message::decode::<jobsrv::WorkerCommand>(&self.msg)?;
+                if wc.get_op() == jobsrv::WorkerOperation::StartJob {
+                    self.fe_sock.recv(&mut self.msg, 0)?;
+                }
+
                 match self.state {
                     State::Ready => {
-                        self.runner_cli.send(&self.msg)?;
-                        {
-                            let reply = self.runner_cli.recv_ack()?;
-                            self.fe_sock.send(reply, 0)?;
+                        match wc.get_op() {
+                            jobsrv::WorkerOperation::StartJob => self.start_job()?,
+                            jobsrv::WorkerOperation::CancelJob => {
+                                debug!("Received unexpected Cancel for Ready worker")
+                            }
                         }
-                        self.set_busy()?;
                     }
                     State::Busy => {
-                        let mut reply = message::decode::<protocol::jobsrv::Job>(&self.msg)?;
-                        reply.set_state(protocol::jobsrv::JobState::Rejected);
-                        self.fe_sock.send(&message::encode(&reply)?, 0)?;
+                        match wc.get_op() {
+                            jobsrv::WorkerOperation::StartJob => self.reject_job()?,
+                            jobsrv::WorkerOperation::CancelJob => println!("TBD"),
+                        }
                     }
                 }
                 fe_msg = false;
             }
         }
+    }
+
+    fn start_job(&mut self) -> Result<()> {
+        self.runner_cli.send(&self.msg)?;
+        {
+            let reply = self.runner_cli.recv_ack()?;
+            self.fe_sock.send(reply, 0)?;
+        }
+        self.set_busy()?;
+        Ok(())
+    }
+
+    fn reject_job(&mut self) -> Result<()> {
+        let mut reply = message::decode::<jobsrv::Job>(&self.msg)?;
+        reply.set_state(jobsrv::JobState::Rejected);
+        self.fe_sock.send(&message::encode(&reply)?, 0)?;
+        Ok(())
     }
 
     fn set_busy(&mut self) -> Result<()> {
